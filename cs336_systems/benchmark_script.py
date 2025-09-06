@@ -13,6 +13,7 @@ import argparse
 import timeit
 import torch
 import torch.nn as nn
+import torch.cuda.nvtx as nvtx
 import numpy as np
 from typing import Optional, Tuple, List
 
@@ -26,7 +27,8 @@ def create_model(
     d_ff: int = 2048,
     vocab_size: int = 10000,
     context_length: int = 512,
-    device: str = "cuda"
+    device: str = "cuda",
+    use_nvtx: bool = False
 ) -> TransformerLM:
     """Initialize a Transformer model with given hyperparameters."""
     model = TransformerLM(
@@ -36,7 +38,8 @@ def create_model(
         theta=10000.0,  # RoPE theta parameter
         vocab_size=vocab_size,
         context_length=context_length,
-        num_layers=n_layers
+        num_layers=n_layers,
+        use_nvtx=use_nvtx
     )
     model = model.to(device)
     return model
@@ -58,28 +61,47 @@ def benchmark_forward_only(
     model: TransformerLM,
     x: torch.Tensor,
     n_steps: int,
-    warmup_steps: int = 5
+    warmup_steps: int = 5,
+    use_nvtx: bool = False
 ) -> float:
     """Benchmark forward pass only."""
     device = next(model.parameters()).device
     
     # Warm-up
     print(f"Running {warmup_steps} warm-up steps...")
-    for _ in range(warmup_steps):
-        with torch.no_grad():
-            _ = model(x)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+    if use_nvtx:
+        with nvtx.range("warmup"):
+            for step in range(warmup_steps):
+                with nvtx.range(f"warmup_step_{step}"):
+                    with torch.no_grad():
+                        _ = model(x)
+                        if device.type == "cuda":
+                            torch.cuda.synchronize()
+    else:
+        for step in range(warmup_steps):
+            with torch.no_grad():
+                _ = model(x)
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
     
     # Timing
     print(f"Timing {n_steps} forward-only steps...")
     start_time = timeit.default_timer()
     
-    for _ in range(n_steps):
-        with torch.no_grad():
-            _ = model(x)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+    if use_nvtx:
+        with nvtx.range("forward_timing"):
+            for step in range(n_steps):
+                with nvtx.range(f"forward_step_{step}"):
+                    with torch.no_grad():
+                        _ = model(x)
+                        if device.type == "cuda":
+                            torch.cuda.synchronize()
+    else:
+        for step in range(n_steps):
+            with torch.no_grad():
+                _ = model(x)
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
     
     end_time = timeit.default_timer()
     total_time = end_time - start_time
@@ -92,7 +114,8 @@ def benchmark_forward_backward(
     x: torch.Tensor,
     y: torch.Tensor,
     n_steps: int,
-    warmup_steps: int = 5
+    warmup_steps: int = 5,
+    use_nvtx: bool = False
 ) -> float:
     """Benchmark forward and backward passes."""
     device = next(model.parameters()).device
@@ -100,25 +123,51 @@ def benchmark_forward_backward(
     
     # Warm-up
     print(f"Running {warmup_steps} warm-up steps...")
-    for _ in range(warmup_steps):
-        model.zero_grad()
-        logits = model(x)
-        loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
-        loss.backward()
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+    if use_nvtx:
+        with nvtx.range("warmup"):
+            for step in range(warmup_steps):
+                with nvtx.range(f"warmup_step_{step}"):
+                    model.zero_grad()
+                    with nvtx.range("forward"):
+                        logits = model(x)
+                        loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                    with nvtx.range("backward"):
+                        loss.backward()
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+    else:
+        for step in range(warmup_steps):
+            model.zero_grad()
+            logits = model(x)
+            loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+            loss.backward()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
     
     # Timing
     print(f"Timing {n_steps} forward+backward steps...")
     start_time = timeit.default_timer()
     
-    for _ in range(n_steps):
-        model.zero_grad()
-        logits = model(x)
-        loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
-        loss.backward()
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+    if use_nvtx:
+        with nvtx.range("forward_backward_timing"):
+            for step in range(n_steps):
+                with nvtx.range(f"train_step_{step}"):
+                    model.zero_grad()
+                    with nvtx.range("forward"):
+                        logits = model(x)
+                        loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                    with nvtx.range("backward"):
+                        loss.backward()
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+    else:
+        for step in range(n_steps):
+            model.zero_grad()
+            logits = model(x)
+            loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+            loss.backward()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
     
     end_time = timeit.default_timer()
     total_time = end_time - start_time
@@ -145,6 +194,7 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=5, help="Number of warm-up steps")
     parser.add_argument("--n_trials", type=int, default=1, help="Number of trials to run for statistics")
     parser.add_argument("--forward_only", action="store_true", help="Benchmark forward pass only")
+    parser.add_argument("--use_nvtx", action="store_true", help="Enable NVTX annotations for profiling")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda/cpu)")
     
     args = parser.parse_args()
@@ -159,6 +209,7 @@ def main():
     print(f"Data config: batch_size={args.batch_size}, context_length={args.context_length}, vocab_size={args.vocab_size}")
     print(f"Benchmark config: n_steps={args.n_steps}, warmup_steps={args.warmup_steps}, n_trials={args.n_trials}, device={args.device}")
     print(f"Mode: {'Forward only' if args.forward_only else 'Forward + Backward'}")
+    print(f"NVTX annotations: {'Enabled' if args.use_nvtx else 'Disabled'}")
     print()
     
     # Initialize model
@@ -170,7 +221,8 @@ def main():
         d_ff=args.d_ff,
         vocab_size=args.vocab_size,
         context_length=args.context_length,
-        device=args.device
+        device=args.device,
+        use_nvtx=args.use_nvtx
     )
     
     # Count parameters
@@ -193,9 +245,9 @@ def main():
             print(f"\n--- Trial {trial + 1}/{args.n_trials} ---")
         
         if args.forward_only:
-            total_time = benchmark_forward_only(model, x, args.n_steps, args.warmup_steps)
+            total_time = benchmark_forward_only(model, x, args.n_steps, args.warmup_steps, args.use_nvtx)
         else:
-            total_time = benchmark_forward_backward(model, x, y, args.n_steps, args.warmup_steps)
+            total_time = benchmark_forward_backward(model, x, y, args.n_steps, args.warmup_steps, args.use_nvtx)
         
         avg_time = total_time / args.n_steps
         trial_times.append(avg_time)
