@@ -17,7 +17,7 @@ import torch.cuda.nvtx as nvtx
 import numpy as np
 from typing import Optional, Tuple, List
 
-from cs336_basics.transformers import TransformerLM
+from cs336_basics.transformers import TransformerLM, AdamWOptimizer
 
 
 def create_model(
@@ -62,7 +62,8 @@ def benchmark_forward_only(
     x: torch.Tensor,
     n_steps: int,
     warmup_steps: int = 5,
-    use_nvtx: bool = False
+    use_nvtx: bool = False,
+    use_mixed_precision: bool = False
 ) -> float:
     """Benchmark forward pass only."""
     device = next(model.parameters()).device
@@ -74,13 +75,21 @@ def benchmark_forward_only(
             for step in range(warmup_steps):
                 with nvtx.range(f"warmup_step_{step}"):
                     with torch.no_grad():
-                        _ = model(x)
+                        if use_mixed_precision:
+                            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                                _ = model(x)
+                        else:
+                            _ = model(x)
                         if device.type == "cuda":
                             torch.cuda.synchronize()
     else:
         for step in range(warmup_steps):
             with torch.no_grad():
-                _ = model(x)
+                if use_mixed_precision:
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                        _ = model(x)
+                else:
+                    _ = model(x)
                 if device.type == "cuda":
                     torch.cuda.synchronize()
     
@@ -93,13 +102,21 @@ def benchmark_forward_only(
             for step in range(n_steps):
                 with nvtx.range(f"forward_step_{step}"):
                     with torch.no_grad():
-                        _ = model(x)
+                        if use_mixed_precision:
+                            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                                _ = model(x)
+                        else:
+                            _ = model(x)
                         if device.type == "cuda":
                             torch.cuda.synchronize()
     else:
         for step in range(n_steps):
             with torch.no_grad():
-                _ = model(x)
+                if use_mixed_precision:
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                        _ = model(x)
+                else:
+                    _ = model(x)
                 if device.type == "cuda":
                     torch.cuda.synchronize()
     
@@ -115,11 +132,13 @@ def benchmark_forward_backward(
     y: torch.Tensor,
     n_steps: int,
     warmup_steps: int = 5,
-    use_nvtx: bool = False
+    use_nvtx: bool = False,
+    use_mixed_precision: bool = False
 ) -> float:
     """Benchmark forward and backward passes."""
     device = next(model.parameters()).device
     criterion = nn.CrossEntropyLoss()
+    scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
     
     # Warm-up
     print(f"Running {warmup_steps} warm-up steps...")
@@ -129,18 +148,32 @@ def benchmark_forward_backward(
                 with nvtx.range(f"warmup_step_{step}"):
                     model.zero_grad()
                     with nvtx.range("forward"):
-                        logits = model(x)
-                        loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                        if use_mixed_precision:
+                            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                                logits = model(x)
+                                loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                        else:
+                            logits = model(x)
+                            loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
                     with nvtx.range("backward"):
-                        loss.backward()
+                        if use_mixed_precision:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
                     if device.type == "cuda":
                         torch.cuda.synchronize()
     else:
         for step in range(warmup_steps):
             model.zero_grad()
-            logits = model(x)
-            loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
-            loss.backward()
+            if use_mixed_precision:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    logits = model(x)
+                    loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                scaler.scale(loss).backward()
+            else:
+                logits = model(x)
+                loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                loss.backward()
             if device.type == "cuda":
                 torch.cuda.synchronize()
     
@@ -154,18 +187,147 @@ def benchmark_forward_backward(
                 with nvtx.range(f"train_step_{step}"):
                     model.zero_grad()
                     with nvtx.range("forward"):
-                        logits = model(x)
-                        loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                        if use_mixed_precision:
+                            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                                logits = model(x)
+                                loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                        else:
+                            logits = model(x)
+                            loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
                     with nvtx.range("backward"):
-                        loss.backward()
+                        if use_mixed_precision:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
                     if device.type == "cuda":
                         torch.cuda.synchronize()
     else:
         for step in range(n_steps):
             model.zero_grad()
-            logits = model(x)
-            loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
-            loss.backward()
+            if use_mixed_precision:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    logits = model(x)
+                    loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                scaler.scale(loss).backward()
+            else:
+                logits = model(x)
+                loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                loss.backward()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+    
+    end_time = timeit.default_timer()
+    total_time = end_time - start_time
+    
+    return total_time
+
+
+def benchmark_forward_backward_optimizer(
+    model: TransformerLM,
+    optimizer: torch.optim.Optimizer,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    n_steps: int,
+    warmup_steps: int = 5,
+    use_nvtx: bool = False,
+    use_mixed_precision: bool = False
+) -> float:
+    """Benchmark forward, backward, and optimizer step."""
+    device = next(model.parameters()).device
+    criterion = nn.CrossEntropyLoss()
+    scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
+    
+    # Warm-up
+    print(f"Running {warmup_steps} warm-up steps...")
+    if use_nvtx:
+        with nvtx.range("warmup"):
+            for step in range(warmup_steps):
+                with nvtx.range(f"warmup_step_{step}"):
+                    optimizer.zero_grad()
+                    with nvtx.range("forward"):
+                        if use_mixed_precision:
+                            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                                logits = model(x)
+                                loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                        else:
+                            logits = model(x)
+                            loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                    with nvtx.range("backward"):
+                        if use_mixed_precision:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+                    with nvtx.range("optimizer"):
+                        if use_mixed_precision:
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            optimizer.step()
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+    else:
+        for step in range(warmup_steps):
+            optimizer.zero_grad()
+            if use_mixed_precision:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    logits = model(x)
+                    loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits = model(x)
+                loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                loss.backward()
+                optimizer.step()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+    
+    # Timing
+    print(f"Timing {n_steps} forward+backward+optimizer steps...")
+    start_time = timeit.default_timer()
+    
+    if use_nvtx:
+        with nvtx.range("forward_backward_optimizer_timing"):
+            for step in range(n_steps):
+                with nvtx.range(f"train_step_{step}"):
+                    optimizer.zero_grad()
+                    with nvtx.range("forward"):
+                        if use_mixed_precision:
+                            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                                logits = model(x)
+                                loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                        else:
+                            logits = model(x)
+                            loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                    with nvtx.range("backward"):
+                        if use_mixed_precision:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+                    with nvtx.range("optimizer"):
+                        if use_mixed_precision:
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            optimizer.step()
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+    else:
+        for step in range(n_steps):
+            optimizer.zero_grad()
+            if use_mixed_precision:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    logits = model(x)
+                    loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits = model(x)
+                loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                loss.backward()
+                optimizer.step()
             if device.type == "cuda":
                 torch.cuda.synchronize()
     
@@ -194,7 +356,9 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=5, help="Number of warm-up steps")
     parser.add_argument("--n_trials", type=int, default=1, help="Number of trials to run for statistics")
     parser.add_argument("--forward_only", action="store_true", help="Benchmark forward pass only")
+    parser.add_argument("--with_optimizer", action="store_true", help="Include optimizer step in backward benchmark")
     parser.add_argument("--use_nvtx", action="store_true", help="Enable NVTX annotations for profiling")
+    parser.add_argument("--use_mixed_precision", action="store_true", help="Enable mixed precision training with autocast")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda/cpu)")
     
     args = parser.parse_args()
@@ -204,12 +368,21 @@ def main():
         print("CUDA not available, falling back to CPU")
         args.device = "cpu"
     
+    # Determine benchmark mode
+    if args.forward_only:
+        mode = "Forward only"
+    elif args.with_optimizer:
+        mode = "Forward + Backward + Optimizer"
+    else:
+        mode = "Forward + Backward"
+    
     print("=== Transformer Model Benchmarking ===")
     print(f"Model config: d_model={args.d_model}, n_layers={args.n_layers}, n_heads={args.n_heads}")
     print(f"Data config: batch_size={args.batch_size}, context_length={args.context_length}, vocab_size={args.vocab_size}")
     print(f"Benchmark config: n_steps={args.n_steps}, warmup_steps={args.warmup_steps}, n_trials={args.n_trials}, device={args.device}")
-    print(f"Mode: {'Forward only' if args.forward_only else 'Forward + Backward'}")
+    print(f"Mode: {mode}")
     print(f"NVTX annotations: {'Enabled' if args.use_nvtx else 'Disabled'}")
+    print(f"Mixed precision: {'Enabled' if args.use_mixed_precision else 'Disabled'}")
     print()
     
     # Initialize model
@@ -238,6 +411,12 @@ def main():
         device=args.device
     )
     
+    # Create optimizer if needed
+    optimizer = None
+    if args.with_optimizer and not args.forward_only:
+        print("Creating optimizer...")
+        optimizer = AdamWOptimizer(model.parameters(), lr=1e-4, weight_decay=1e-2)
+    
     # Run multiple trials
     trial_times = []
     for trial in range(args.n_trials):
@@ -245,9 +424,11 @@ def main():
             print(f"\n--- Trial {trial + 1}/{args.n_trials} ---")
         
         if args.forward_only:
-            total_time = benchmark_forward_only(model, x, args.n_steps, args.warmup_steps, args.use_nvtx)
+            total_time = benchmark_forward_only(model, x, args.n_steps, args.warmup_steps, args.use_nvtx, args.use_mixed_precision)
+        elif args.with_optimizer:
+            total_time = benchmark_forward_backward_optimizer(model, optimizer, x, y, args.n_steps, args.warmup_steps, args.use_nvtx, args.use_mixed_precision)
         else:
-            total_time = benchmark_forward_backward(model, x, y, args.n_steps, args.warmup_steps, args.use_nvtx)
+            total_time = benchmark_forward_backward(model, x, y, args.n_steps, args.warmup_steps, args.use_nvtx, args.use_mixed_precision)
         
         avg_time = total_time / args.n_steps
         trial_times.append(avg_time)
