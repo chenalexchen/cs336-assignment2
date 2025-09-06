@@ -59,6 +59,9 @@ cover/
 *.mo
 *.pot
 
+# Nsys
+*.nsys-rep
+
 # Django stuff:
 *.log
 local_settings.py
