@@ -63,7 +63,8 @@ def benchmark_forward_only(
     n_steps: int,
     warmup_steps: int = 5,
     use_nvtx: bool = False,
-    use_mixed_precision: bool = False
+    use_mixed_precision: bool = False,
+    memory_profile: bool = False
 ) -> float:
     """Benchmark forward pass only."""
     device = next(model.parameters()).device
@@ -95,6 +96,11 @@ def benchmark_forward_only(
     
     # Timing
     print(f"Timing {n_steps} forward-only steps...")
+    
+    # Start memory profiling if requested (after warm-up)
+    if memory_profile and device.type == "cuda":
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+    
     start_time = timeit.default_timer()
     
     if use_nvtx:
@@ -123,6 +129,11 @@ def benchmark_forward_only(
     end_time = timeit.default_timer()
     total_time = end_time - start_time
     
+    # Save memory snapshot and stop profiling if requested
+    if memory_profile and device.type == "cuda":
+        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+    
     return total_time
 
 
@@ -133,7 +144,8 @@ def benchmark_forward_backward(
     n_steps: int,
     warmup_steps: int = 5,
     use_nvtx: bool = False,
-    use_mixed_precision: bool = False
+    use_mixed_precision: bool = False,
+    memory_profile: bool = False
 ) -> float:
     """Benchmark forward and backward passes."""
     device = next(model.parameters()).device
@@ -179,6 +191,11 @@ def benchmark_forward_backward(
     
     # Timing
     print(f"Timing {n_steps} forward+backward steps...")
+    
+    # Start memory profiling if requested (after warm-up)
+    if memory_profile and device.type == "cuda":
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+    
     start_time = timeit.default_timer()
     
     if use_nvtx:
@@ -219,6 +236,11 @@ def benchmark_forward_backward(
     end_time = timeit.default_timer()
     total_time = end_time - start_time
     
+    # Save memory snapshot and stop profiling if requested
+    if memory_profile and device.type == "cuda":
+        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+    
     return total_time
 
 
@@ -230,7 +252,8 @@ def benchmark_forward_backward_optimizer(
     n_steps: int,
     warmup_steps: int = 5,
     use_nvtx: bool = False,
-    use_mixed_precision: bool = False
+    use_mixed_precision: bool = False,
+    memory_profile: bool = False
 ) -> float:
     """Benchmark forward, backward, and optimizer step."""
     device = next(model.parameters()).device
@@ -285,6 +308,11 @@ def benchmark_forward_backward_optimizer(
     
     # Timing
     print(f"Timing {n_steps} forward+backward+optimizer steps...")
+    
+    # Start memory profiling if requested (after warm-up)
+    if memory_profile and device.type == "cuda":
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+    
     start_time = timeit.default_timer()
     
     if use_nvtx:
@@ -334,6 +362,11 @@ def benchmark_forward_backward_optimizer(
     end_time = timeit.default_timer()
     total_time = end_time - start_time
     
+    # Save memory snapshot and stop profiling if requested
+    if memory_profile and device.type == "cuda":
+        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+    
     return total_time
 
 
@@ -359,6 +392,7 @@ def main():
     parser.add_argument("--with_optimizer", action="store_true", help="Include optimizer step in backward benchmark")
     parser.add_argument("--use_nvtx", action="store_true", help="Enable NVTX annotations for profiling")
     parser.add_argument("--use_mixed_precision", action="store_true", help="Enable mixed precision training with autocast")
+    parser.add_argument("--memory_profile", action="store_true", help="Enable memory profiling with snapshot")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda/cpu)")
     
     args = parser.parse_args()
@@ -383,6 +417,7 @@ def main():
     print(f"Mode: {mode}")
     print(f"NVTX annotations: {'Enabled' if args.use_nvtx else 'Disabled'}")
     print(f"Mixed precision: {'Enabled' if args.use_mixed_precision else 'Disabled'}")
+    print(f"Memory profiling: {'Enabled' if args.memory_profile else 'Disabled'}")
     print()
     
     # Initialize model
@@ -424,11 +459,11 @@ def main():
             print(f"\n--- Trial {trial + 1}/{args.n_trials} ---")
         
         if args.forward_only:
-            total_time = benchmark_forward_only(model, x, args.n_steps, args.warmup_steps, args.use_nvtx, args.use_mixed_precision)
+            total_time = benchmark_forward_only(model, x, args.n_steps, args.warmup_steps, args.use_nvtx, args.use_mixed_precision, args.memory_profile)
         elif args.with_optimizer:
-            total_time = benchmark_forward_backward_optimizer(model, optimizer, x, y, args.n_steps, args.warmup_steps, args.use_nvtx, args.use_mixed_precision)
+            total_time = benchmark_forward_backward_optimizer(model, optimizer, x, y, args.n_steps, args.warmup_steps, args.use_nvtx, args.use_mixed_precision, args.memory_profile)
         else:
-            total_time = benchmark_forward_backward(model, x, y, args.n_steps, args.warmup_steps, args.use_nvtx, args.use_mixed_precision)
+            total_time = benchmark_forward_backward(model, x, y, args.n_steps, args.warmup_steps, args.use_nvtx, args.use_mixed_precision, args.memory_profile)
         
         avg_time = total_time / args.n_steps
         trial_times.append(avg_time)
