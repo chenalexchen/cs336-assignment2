@@ -28,7 +28,9 @@ def create_model(
     vocab_size: int = 10000,
     context_length: int = 512,
     device: str = "cuda",
-    use_nvtx: bool = False
+    use_nvtx: bool = False,
+    use_compile: bool = False,
+    compile_backend: str = "inductor"
 ) -> TransformerLM:
     """Initialize a Transformer model with given hyperparameters."""
     model = TransformerLM(
@@ -42,6 +44,15 @@ def create_model(
         use_nvtx=use_nvtx
     )
     model = model.to(device)
+
+    if use_compile:
+        print(f"Compiling model with backend: {compile_backend}")
+        try:
+            model = torch.compile(model, backend=compile_backend)
+            print("Model compilation successful")
+        except Exception as e:
+            print(f"Warning: Model compilation failed, using eager mode: {e}")
+
     return model
 
 
@@ -393,6 +404,8 @@ def main():
     parser.add_argument("--use_nvtx", action="store_true", help="Enable NVTX annotations for profiling")
     parser.add_argument("--use_mixed_precision", action="store_true", help="Enable mixed precision training with autocast")
     parser.add_argument("--memory_profile", action="store_true", help="Enable memory profiling with snapshot")
+    parser.add_argument("--use_compile", action="store_true", help="Use torch.compile to compile the model")
+    parser.add_argument("--compile_backend", type=str, default="inductor", help="Backend for torch.compile (inductor, aot_eager, etc.)")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda/cpu)")
     
     args = parser.parse_args()
@@ -418,6 +431,7 @@ def main():
     print(f"NVTX annotations: {'Enabled' if args.use_nvtx else 'Disabled'}")
     print(f"Mixed precision: {'Enabled' if args.use_mixed_precision else 'Disabled'}")
     print(f"Memory profiling: {'Enabled' if args.memory_profile else 'Disabled'}")
+    print(f"Model compilation: {'Enabled (' + args.compile_backend + ')' if args.use_compile else 'Disabled'}")
     print()
     
     # Initialize model
@@ -430,7 +444,9 @@ def main():
         vocab_size=args.vocab_size,
         context_length=args.context_length,
         device=args.device,
-        use_nvtx=args.use_nvtx
+        use_nvtx=args.use_nvtx,
+        use_compile=args.use_compile,
+        compile_backend=args.compile_backend
     )
     
     # Count parameters
