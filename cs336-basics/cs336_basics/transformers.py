@@ -155,11 +155,13 @@ class RoPE(nn.Module):
         Returns:
             Rotated tensor of same shape as x
         """
-        # Check if we need to expand cache
-        max_pos = positions.max().item()
-        if max_pos >= self.max_seq_len:
-            self._build_rotation_cache(max_pos + 1, device=positions.device)
-            self.max_seq_len = max_pos + 1
+        # Check if positions exceed pre-allocated cache size
+        # Using tensor comparison to avoid graph breaks in torch.compile
+        if torch.any(positions >= self.max_seq_len):
+            # Only call .item() if we actually hit the error case (rare)
+            max_pos = positions.max().item()
+            raise ValueError(f"Position {max_pos} exceeds max_seq_len {self.max_seq_len}. "
+                           f"Initialize RoPE with larger max_seq_len to avoid this error.")
 
         # Get cos and sin for the given positions
         cos = self.cos_cache[positions]  # (..., seq_len, d_model // 2)
