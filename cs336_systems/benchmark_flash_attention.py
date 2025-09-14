@@ -132,23 +132,8 @@ class AdaptiveFlashAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_O):
-        # Use same backward as FlashAttentionTriton
-        L, Q, K, V, O = ctx.saved_tensors
-        is_causal = ctx.is_causal
-
-        d = Q.shape[-1]
-        scale = 1.0 / math.sqrt(d)
-
-        # Compute D vector
-        D = torch.sum(grad_O * O, dim=-1)
-
-        # Use the compiled backward function
-        from cs336_systems.flash_attention import _flash_backward_compiled
-        grad_Q, grad_K, grad_V = _flash_backward_compiled(
-            Q, K, V, O, grad_O, L, D, is_causal, scale
-        )
-
-        return grad_Q, grad_K, grad_V, None
+        # Use the new Triton backward implementation
+        return FlashAttentionTriton.backward(ctx, grad_O)
 
 
 def make_inputs(seq_len: int, d_model: int, dtype: torch.dtype) -> Tuple[torch.Tensor, ...]:
