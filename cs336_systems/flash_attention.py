@@ -6,6 +6,69 @@ import triton.language as tl
 from jaxtyping import Float
 
 
+@torch.compile
+def _flash_backward_compiled(Q, K, V, O, grad_O, L, D, is_causal, scale):
+    """Compiled helper function for FlashAttention backward pass"""
+    B, N_q, d = Q.shape
+    B, N_k, d = K.shape
+
+    B_q = 32  # Query block size
+    B_k = 32  # Key/Value block size
+
+    # Initialize output gradients
+    grad_Q = torch.zeros_like(Q)
+    grad_K = torch.zeros_like(K)
+    grad_V = torch.zeros_like(V)
+
+    # Process in blocks
+    for i in range(0, N_q, B_q):
+        q_start = i
+        q_end = min(i + B_q, N_q)
+        q_block = Q[:, q_start:q_end, :]
+        grad_O_block = grad_O[:, q_start:q_end, :]
+        L_block = L[:, q_start:q_end]
+        D_block = D[:, q_start:q_end]
+
+        grad_Q_block = torch.zeros_like(q_block)
+
+        for j in range(0, N_k, B_k):
+            k_start = j
+            k_end = min(j + B_k, N_k)
+            k_block = K[:, k_start:k_end, :]
+            v_block = V[:, k_start:k_end, :]
+
+            # Recompute attention scores
+            s_block = torch.einsum('bqd,bkd->bqk', q_block, k_block) * scale
+
+            # Apply causal mask if needed
+            if is_causal:
+                q_indices = torch.arange(q_start, q_end, device=Q.device)[:, None]
+                k_indices = torch.arange(k_start, k_end, device=Q.device)[None, :]
+                causal_mask = q_indices >= k_indices
+                s_block = torch.where(causal_mask, s_block, -torch.inf)
+
+            # Compute probabilities
+            p_block = torch.exp(s_block - L_block.unsqueeze(-1))
+
+            # Compute gradients
+            grad_S_block = p_block * (
+                torch.einsum('bqd,bkd->bqk', grad_O_block, v_block) -
+                D_block.unsqueeze(-1)
+            )
+
+            if is_causal:
+                grad_S_block = torch.where(causal_mask, grad_S_block, 0.0)
+
+            # Accumulate gradients
+            grad_Q_block += torch.einsum('bqk,bkd->bqd', grad_S_block, k_block) * scale
+            grad_K[:, k_start:k_end, :] += torch.einsum('bqk,bqd->bkd', grad_S_block, q_block) * scale
+            grad_V[:, k_start:k_end, :] += torch.einsum('bqk,bqd->bkd', p_block, grad_O_block)
+
+        grad_Q[:, q_start:q_end, :] = grad_Q_block
+
+    return grad_Q, grad_K, grad_V
+
+
 class FlashAttentionPytorch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q: Float[torch.Tensor, 'B N_q d'],
@@ -84,7 +147,21 @@ class FlashAttentionPytorch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_O: Float[torch.Tensor, 'B N_q d']):
-        raise NotImplementedError('backward is not yet implemented')
+        L, Q, K, V, O = ctx.saved_tensors
+        is_causal = ctx.is_causal
+
+        d = Q.shape[-1]
+        scale = 1.0 / math.sqrt(d)
+
+        # Compute D vector: D_i = sum_j(dO_ij * O_ij) for each query
+        D = torch.sum(grad_O * O, dim=-1)  # [B, N_q]
+
+        # Use torch.compile optimized function
+        grad_Q, grad_K, grad_V = _flash_backward_compiled(
+            Q, K, V, O, grad_O, L, D, is_causal, scale
+        )
+
+        return grad_Q, grad_K, grad_V, None  # None for is_causal gradient
 
 
 @triton.jit
@@ -269,4 +346,20 @@ class FlashAttentionTriton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_O: Float[torch.Tensor, 'B N_q d']):
-        raise NotImplementedError('backward is not yet implemented')
+        # For now, use the same PyTorch implementation as the PyTorch version
+        # A full Triton backward kernel would be implemented separately
+        L, Q, K, V, O = ctx.saved_tensors
+        is_causal = ctx.is_causal
+
+        d = Q.shape[-1]
+        scale = 1.0 / math.sqrt(d)
+
+        # Compute D vector: D_i = sum_j(dO_ij * O_ij) for each query
+        D = torch.sum(grad_O * O, dim=-1)  # [B, N_q]
+
+        # Use torch.compile optimized function
+        grad_Q, grad_K, grad_V = _flash_backward_compiled(
+            Q, K, V, O, grad_O, L, D, is_causal, scale
+        )
+
+        return grad_Q, grad_K, grad_V, None  # None for is_causal gradient
