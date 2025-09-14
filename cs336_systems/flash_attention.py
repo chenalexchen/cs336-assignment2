@@ -164,308 +164,10 @@ class FlashAttentionPytorch(torch.autograd.Function):
         return grad_Q, grad_K, grad_V, None  # None for is_causal gradient
 
 
-@triton.jit
-def flash_bwd_dq_kernel(
-    Q_ptr, K_ptr, V_ptr, L_ptr, D_ptr,
-    grad_O_ptr, grad_Q_ptr,
-    stride_qb, stride_qq, stride_qd,
-    stride_kb, stride_kk, stride_kd,
-    stride_vb, stride_vk, stride_vd,
-    stride_lb, stride_lq,
-    stride_db, stride_dq,
-    stride_gob, stride_goq, stride_god,
-    stride_gqb, stride_gqq, stride_gqd,
-    N_QUERIES, N_KEYS,
-    scale,
-    is_causal: tl.constexpr,
-    D: tl.constexpr,
-    Q_TILE_SIZE: tl.constexpr,
-    K_TILE_SIZE: tl.constexpr,
-):
-    """Kernel for computing dQ gradients - no race conditions"""
-    # Program indices
-    query_tile_index = tl.program_id(0)
-    batch_index = tl.program_id(1)
-
-    # Query block bounds
-    q_start = query_tile_index * Q_TILE_SIZE
-
-    # Load Q tile
-    Q_block_ptr = tl.make_block_ptr(
-        Q_ptr + batch_index * stride_qb,
-        shape=(N_QUERIES, D),
-        strides=(stride_qq, stride_qd),
-        offsets=(q_start, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    q = tl.load(Q_block_ptr)  # [Q_TILE_SIZE, D]
-
-    # Load grad_O tile
-    grad_O_block_ptr = tl.make_block_ptr(
-        grad_O_ptr + batch_index * stride_gob,
-        shape=(N_QUERIES, D),
-        strides=(stride_goq, stride_god),
-        offsets=(q_start, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    grad_o = tl.load(grad_O_block_ptr)  # [Q_TILE_SIZE, D]
-
-    # Load L and D tiles
-    L_block_ptr = tl.make_block_ptr(
-        L_ptr + batch_index * stride_lb,
-        shape=(N_QUERIES,),
-        strides=(stride_lq,),
-        offsets=(q_start,),
-        block_shape=(Q_TILE_SIZE,),
-        order=(0,),
-    )
-    l_tile = tl.load(L_block_ptr)  # [Q_TILE_SIZE]
-
-    D_block_ptr = tl.make_block_ptr(
-        D_ptr + batch_index * stride_db,
-        shape=(N_QUERIES,),
-        strides=(stride_dq,),
-        offsets=(q_start,),
-        block_shape=(Q_TILE_SIZE,),
-        order=(0,),
-    )
-    d_tile = tl.load(D_block_ptr)  # [Q_TILE_SIZE]
-
-    # Initialize grad_Q accumulator
-    grad_q = tl.zeros([Q_TILE_SIZE, D], dtype=tl.float32)
-
-    # Initialize K and V block pointers
-    K_block_ptr = tl.make_block_ptr(
-        K_ptr + batch_index * stride_kb,
-        shape=(N_KEYS, D),
-        strides=(stride_kk, stride_kd),
-        offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
-        order=(1, 0),
-    )
-
-    V_block_ptr = tl.make_block_ptr(
-        V_ptr + batch_index * stride_vb,
-        shape=(N_KEYS, D),
-        strides=(stride_vk, stride_vd),
-        offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
-        order=(1, 0),
-    )
-
-    # Loop over K tiles to compute dQ
-    num_k_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
-    for k_tile_idx in range(num_k_tiles):
-        k_start = k_tile_idx * K_TILE_SIZE
-
-        # Load K and V tiles
-        k = tl.load(K_block_ptr)  # [K_TILE_SIZE, D]
-        v = tl.load(V_block_ptr)  # [K_TILE_SIZE, D]
-
-        # Recompute attention scores for dQ computation
-        kt = tl.trans(k)  # [D, K_TILE_SIZE]
-        s = tl.dot(q, kt, allow_tf32=False) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
-
-        # Apply causal mask if needed
-        if is_causal:
-            q_indices = q_start + tl.arange(0, Q_TILE_SIZE)[:, None]  # [Q_TILE_SIZE, 1]
-            k_indices = k_start + tl.arange(0, K_TILE_SIZE)[None, :]  # [1, K_TILE_SIZE]
-            causal_mask = q_indices >= k_indices  # [Q_TILE_SIZE, K_TILE_SIZE]
-            s = tl.where(causal_mask, s, s - 1e6)  # Add -1e6 to masked elements
-
-        # Compute probabilities P for dQ
-        p = tl.exp(s - l_tile[:, None])  # [Q_TILE_SIZE, K_TILE_SIZE]
-
-        # Compute grad_S = P * (grad_O @ V^T - D)
-        # Ensure dtype consistency for matrix multiplication
-        grad_o_v = tl.dot(grad_o.to(tl.float32), tl.trans(v.to(tl.float32)), allow_tf32=False)  # [Q_TILE_SIZE, K_TILE_SIZE]
-        grad_s = p * (grad_o_v - d_tile[:, None])  # [Q_TILE_SIZE, K_TILE_SIZE]
-
-        # Apply causal mask to grad_S if needed
-        if is_causal:
-            grad_s = tl.where(causal_mask, grad_s, 0.0)
-
-        # Accumulate grad_Q
-        grad_q += tl.dot(grad_s, k.to(tl.float32), allow_tf32=False) * scale  # [Q_TILE_SIZE, D]
-
-        # Advance K and V block pointers
-        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
-        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
-
-    # Store grad_Q
-    grad_Q_block_ptr = tl.make_block_ptr(
-        grad_Q_ptr + batch_index * stride_gqb,
-        shape=(N_QUERIES, D),
-        strides=(stride_gqq, stride_gqd),
-        offsets=(q_start, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    grad_q_cast = grad_q.to(grad_Q_block_ptr.type.element_ty)
-    tl.store(grad_Q_block_ptr, grad_q_cast)
 
 
 @triton.jit
-def flash_bwd_dkv_kernel(
-    Q_ptr, K_ptr, V_ptr, L_ptr, D_ptr,
-    grad_O_ptr, grad_K_ptr, grad_V_ptr,
-    stride_qb, stride_qq, stride_qd,
-    stride_kb, stride_kk, stride_kd,
-    stride_vb, stride_vk, stride_vd,
-    stride_lb, stride_lq,
-    stride_db, stride_dq,
-    stride_gob, stride_goq, stride_god,
-    stride_gkb, stride_gkk, stride_gkd,
-    stride_gvb, stride_gvk, stride_gvd,
-    N_QUERIES, N_KEYS,
-    scale,
-    is_causal: tl.constexpr,
-    D: tl.constexpr,
-    Q_TILE_SIZE: tl.constexpr,
-    K_TILE_SIZE: tl.constexpr,
-):
-    """Kernel for computing dK and dV gradients - no race conditions"""
-    # Program indices
-    key_tile_index = tl.program_id(0)
-    batch_index = tl.program_id(1)
-
-    # Key block bounds
-    k_start = key_tile_index * K_TILE_SIZE
-
-    # Load K and V tiles
-    K_block_ptr = tl.make_block_ptr(
-        K_ptr + batch_index * stride_kb,
-        shape=(N_KEYS, D),
-        strides=(stride_kk, stride_kd),
-        offsets=(k_start, 0),
-        block_shape=(K_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    k = tl.load(K_block_ptr)  # [K_TILE_SIZE, D]
-
-    V_block_ptr = tl.make_block_ptr(
-        V_ptr + batch_index * stride_vb,
-        shape=(N_KEYS, D),
-        strides=(stride_vk, stride_vd),
-        offsets=(k_start, 0),
-        block_shape=(K_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    v = tl.load(V_block_ptr)  # [K_TILE_SIZE, D]
-
-    # Initialize grad_K and grad_V accumulators
-    grad_k = tl.zeros([K_TILE_SIZE, D], dtype=tl.float32)
-    grad_v = tl.zeros([K_TILE_SIZE, D], dtype=tl.float32)
-
-    # Initialize Q block pointer
-    Q_block_ptr = tl.make_block_ptr(
-        Q_ptr + batch_index * stride_qb,
-        shape=(N_QUERIES, D),
-        strides=(stride_qq, stride_qd),
-        offsets=(0, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-
-    # Loop over Q tiles to compute dK and dV
-    num_q_tiles = tl.cdiv(N_QUERIES, Q_TILE_SIZE)
-    for q_tile_idx in range(num_q_tiles):
-        q_start = q_tile_idx * Q_TILE_SIZE
-
-        # Load Q tile
-        q = tl.load(Q_block_ptr)  # [Q_TILE_SIZE, D]
-
-        # Load grad_O tile
-        grad_O_block_ptr = tl.make_block_ptr(
-            grad_O_ptr + batch_index * stride_gob,
-            shape=(N_QUERIES, D),
-            strides=(stride_goq, stride_god),
-            offsets=(q_start, 0),
-            block_shape=(Q_TILE_SIZE, D),
-            order=(1, 0),
-        )
-        grad_o = tl.load(grad_O_block_ptr)  # [Q_TILE_SIZE, D]
-
-        # Load L and D tiles
-        L_block_ptr = tl.make_block_ptr(
-            L_ptr + batch_index * stride_lb,
-            shape=(N_QUERIES,),
-            strides=(stride_lq,),
-            offsets=(q_start,),
-            block_shape=(Q_TILE_SIZE,),
-            order=(0,),
-        )
-        l_tile = tl.load(L_block_ptr)  # [Q_TILE_SIZE]
-
-        D_block_ptr = tl.make_block_ptr(
-            D_ptr + batch_index * stride_db,
-            shape=(N_QUERIES,),
-            strides=(stride_dq,),
-            offsets=(q_start,),
-            block_shape=(Q_TILE_SIZE,),
-            order=(0,),
-        )
-        d_tile = tl.load(D_block_ptr)  # [Q_TILE_SIZE]
-
-        # Recompute attention scores for dK/dV computation
-        kt = tl.trans(k)  # [D, K_TILE_SIZE]
-        s = tl.dot(q, kt, allow_tf32=False) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
-
-        # Apply causal mask if needed
-        if is_causal:
-            q_indices = q_start + tl.arange(0, Q_TILE_SIZE)[:, None]  # [Q_TILE_SIZE, 1]
-            k_indices = k_start + tl.arange(0, K_TILE_SIZE)[None, :]  # [1, K_TILE_SIZE]
-            causal_mask = q_indices >= k_indices  # [Q_TILE_SIZE, K_TILE_SIZE]
-            s = tl.where(causal_mask, s, s - 1e6)  # Add -1e6 to masked elements
-
-        # Compute probabilities P for dK/dV
-        p = tl.exp(s - l_tile[:, None])  # [Q_TILE_SIZE, K_TILE_SIZE]
-
-        # Compute grad_S = P * (grad_O @ V^T - D)
-        # Ensure dtype consistency for matrix multiplication
-        grad_o_v = tl.dot(grad_o.to(tl.float32), tl.trans(v.to(tl.float32)), allow_tf32=False)  # [Q_TILE_SIZE, K_TILE_SIZE]
-        grad_s = p * (grad_o_v - d_tile[:, None])  # [Q_TILE_SIZE, K_TILE_SIZE]
-
-        # Apply causal mask to grad_S if needed
-        if is_causal:
-            grad_s = tl.where(causal_mask, grad_s, 0.0)
-
-        # Accumulate grad_K and grad_V
-        grad_k += tl.dot(tl.trans(grad_s), q.to(tl.float32), allow_tf32=False) * scale  # [K_TILE_SIZE, D]
-        grad_v += tl.dot(tl.trans(p), grad_o.to(tl.float32), allow_tf32=False)  # [K_TILE_SIZE, D]
-
-        # Advance Q block pointer
-        Q_block_ptr = tl.advance(Q_block_ptr, (Q_TILE_SIZE, 0))
-
-    # Store grad_K
-    grad_K_block_ptr = tl.make_block_ptr(
-        grad_K_ptr + batch_index * stride_gkb,
-        shape=(N_KEYS, D),
-        strides=(stride_gkk, stride_gkd),
-        offsets=(k_start, 0),
-        block_shape=(K_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    grad_k_cast = grad_k.to(grad_K_block_ptr.type.element_ty)
-    tl.store(grad_K_block_ptr, grad_k_cast)
-
-    # Store grad_V
-    grad_V_block_ptr = tl.make_block_ptr(
-        grad_V_ptr + batch_index * stride_gvb,
-        shape=(N_KEYS, D),
-        strides=(stride_gvk, stride_gvd),
-        offsets=(k_start, 0),
-        block_shape=(K_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    grad_v_cast = grad_v.to(grad_V_block_ptr.type.element_ty)
-    tl.store(grad_V_block_ptr, grad_v_cast)
-
-
-@triton.jit
-def flash_bwd_kernel_algorithm2(
+def flash_bwd_kernel(
     Q_ptr, K_ptr, V_ptr, L_ptr, D_ptr,
     grad_O_ptr, grad_Q_ptr, grad_K_ptr, grad_V_ptr,
     stride_qb, stride_qq, stride_qd,
@@ -570,7 +272,7 @@ def flash_bwd_kernel_algorithm2(
 
         # Compute attention scores: S_i^(j) = Q_i @ (K^(j))^T / sqrt(d)
         kt_j = tl.trans(k_j)  # [D, K_TILE_SIZE]
-        s_ij = tl.dot(q_i, kt_j, allow_tf32=False) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
+        s_ij = tl.dot(q_i, kt_j) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
 
         # Apply causal mask if needed
         if is_causal:
@@ -582,11 +284,14 @@ def flash_bwd_kernel_algorithm2(
         # Compute attention probabilities: P_i^(j) = exp(S_i^(j) - L_i)
         p_ij = tl.exp(s_ij - l_i[:, None])  # [Q_TILE_SIZE, K_TILE_SIZE]
 
+        # Cast P_ij to match do_i's dtype for matrix multiplication
+        p_ij_cast = p_ij.to(do_i.dtype)
+
         # Compute dV^(j) += (P_i^(j))^T * dO_i
-        dv_j += tl.dot(tl.trans(p_ij), do_i, allow_tf32=False)  # [K_TILE_SIZE, D]
+        dv_j = tl.dot(tl.trans(p_ij_cast), do_i, acc=dv_j)  # [K_TILE_SIZE, D]
 
         # Compute dP_i^(j) = dO_i @ (V^(j))^T
-        dp_ij = tl.dot(do_i, tl.trans(v_j), allow_tf32=False)  # [Q_TILE_SIZE, K_TILE_SIZE]
+        dp_ij = tl.dot(do_i, tl.trans(v_j))  # [Q_TILE_SIZE, K_TILE_SIZE]
 
         # Compute dS_i^(j) = P_i^(j) ◦ (dP_i^(j) - D_i) / sqrt(d)
         ds_ij = p_ij * (dp_ij - d_i[:, None]) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
@@ -595,26 +300,28 @@ def flash_bwd_kernel_algorithm2(
         if is_causal:
             ds_ij = tl.where(causal_mask, ds_ij, 0.0)
 
-        # Load current dQ_i from global memory, update with atomic add, write back
-        # This is the "Must be atomic for correctness!" part from Algorithm 2
-        grad_Q_block_ptr = tl.make_block_ptr(
-            grad_Q_ptr + batch_index * stride_gqb,
-            shape=(N_QUERIES, D),
-            strides=(stride_gqq, stride_gqd),
-            offsets=(q_start, 0),
-            block_shape=(Q_TILE_SIZE, D),
-            order=(1, 0),
-        )
-
         # Compute the dQ contribution: dS_i^(j) @ K^(j)
-        dq_contribution = tl.dot(ds_ij, k_j, allow_tf32=False)  # [Q_TILE_SIZE, D]
-        dq_contribution_cast = dq_contribution.to(grad_Q_block_ptr.type.element_ty)
+        dq_contribution = tl.dot(ds_ij, k_j)  # [Q_TILE_SIZE, D]
 
         # Atomic add to dQ (multiple K/V tiles contribute to same Q positions)
-        tl.atomic_add(grad_Q_block_ptr, dq_contribution_cast)
+        # Use element-wise pointers for atomic operations
+        q_range = q_start + tl.arange(0, Q_TILE_SIZE)
+        d_range = tl.arange(0, D)
+
+        # Create pointers for dQ
+        dq_ptrs = (grad_Q_ptr + batch_index * stride_gqb +
+                   q_range[:, None] * stride_gqq +
+                   d_range[None, :] * stride_gqd)
+
+        # Apply bounds mask
+        dq_mask = (q_range[:, None] < N_QUERIES) & (d_range[None, :] < D)
+
+        # Cast to appropriate dtype and atomic add
+        dq_contribution_cast = dq_contribution.to(grad_Q_ptr.dtype.element_ty)
+        tl.atomic_add(dq_ptrs, dq_contribution_cast, mask=dq_mask)
 
         # Compute dK^(j) += (dS_i^(j))^T @ Q_i (local accumulation, no atomics needed)
-        dk_j += tl.dot(tl.trans(ds_ij), q_i, allow_tf32=False)  # [K_TILE_SIZE, D]
+        dk_j = tl.dot(tl.trans(ds_ij), q_i, acc=dk_j)  # [K_TILE_SIZE, D]
 
     # Write final dK^(j) and dV^(j) to global memory (no atomics needed)
     grad_K_block_ptr = tl.make_block_ptr(
@@ -725,7 +432,7 @@ def flash_fwd_kernel(
         k = tl.trans(k)  # [D, K_TILE_SIZE] - fast on-chip transpose
 
         # Compute attention scores: S_ij = Q_i @ K_j^T
-        s_ij = tl.dot(q, k, allow_tf32=False) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
+        s_ij = tl.dot(q, k) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
 
         # Apply causal mask if needed
         if is_causal:
@@ -754,7 +461,8 @@ def flash_fwd_kernel(
         p_ij = p_ij.to(v.dtype)
 
         # Update o_i using online algorithm with accumulation
-        o_i = alpha[:, None] * o_i + tl.dot(p_ij, v, allow_tf32=False)  # [Q_TILE_SIZE, D]
+        o_i = alpha[:, None] * o_i
+        o_i = tl.dot(p_ij, v, acc=o_i)  # [Q_TILE_SIZE, D]
 
         # Update m_i
         m_i = m_i_new
@@ -842,15 +550,14 @@ class FlashAttentionTriton(torch.autograd.Function):
         grad_K = torch.zeros_like(K)
         grad_V = torch.zeros_like(V)
 
-        # Use two-kernel approach (equivalent to Algorithm 2 but avoids atomic issues)
+        # Use single-kernel Algorithm 2 approach with atomics for dQ
+        # Grid is over K/V tiles (outer loop in Algorithm 2)
+        num_k_tiles = triton.cdiv(N_k, K_TILE_SIZE)
+        grid = (num_k_tiles, B)
 
-        # Launch dQ kernel - processes query tiles
-        num_q_tiles = triton.cdiv(N_q, Q_TILE_SIZE)
-        grid_q = (num_q_tiles, B)
-
-        flash_bwd_dq_kernel[grid_q](
+        flash_bwd_kernel[grid](
             Q, K, V, L, D,
-            grad_O, grad_Q,
+            grad_O, grad_Q, grad_K, grad_V,
             Q.stride(0), Q.stride(1), Q.stride(2),
             K.stride(0), K.stride(1), K.stride(2),
             V.stride(0), V.stride(1), V.stride(2),
@@ -858,26 +565,6 @@ class FlashAttentionTriton(torch.autograd.Function):
             D.stride(0), D.stride(1),
             grad_O.stride(0), grad_O.stride(1), grad_O.stride(2),
             grad_Q.stride(0), grad_Q.stride(1), grad_Q.stride(2),
-            N_q, N_k, scale,
-            is_causal,
-            D=d,
-            Q_TILE_SIZE=Q_TILE_SIZE,
-            K_TILE_SIZE=K_TILE_SIZE,
-        )
-
-        # Launch dK/dV kernel - processes key tiles
-        num_k_tiles = triton.cdiv(N_k, K_TILE_SIZE)
-        grid_kv = (num_k_tiles, B)
-
-        flash_bwd_dkv_kernel[grid_kv](
-            Q, K, V, L, D,
-            grad_O, grad_K, grad_V,
-            Q.stride(0), Q.stride(1), Q.stride(2),
-            K.stride(0), K.stride(1), K.stride(2),
-            V.stride(0), V.stride(1), V.stride(2),
-            L.stride(0), L.stride(1),
-            D.stride(0), D.stride(1),
-            grad_O.stride(0), grad_O.stride(1), grad_O.stride(2),
             grad_K.stride(0), grad_K.stride(1), grad_K.stride(2),
             grad_V.stride(0), grad_V.stride(1), grad_V.stride(2),
             N_q, N_k, scale,
