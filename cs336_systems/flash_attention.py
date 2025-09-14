@@ -165,7 +165,6 @@ class FlashAttentionPytorch(torch.autograd.Function):
 
 
 
-
 @triton.jit
 def flash_bwd_kernel(
     Q_ptr, K_ptr, V_ptr, L_ptr, D_ptr,
@@ -208,6 +207,7 @@ def flash_bwd_kernel(
         order=(1, 0),
     )
     k_j = tl.load(K_block_ptr)  # [K_TILE_SIZE, D]
+    k_j = k_j.to(tl.float32)  # Cast to float32 for consistent computations
 
     V_block_ptr = tl.make_block_ptr(
         V_ptr + batch_index * stride_vb,
@@ -218,6 +218,7 @@ def flash_bwd_kernel(
         order=(1, 0),
     )
     v_j = tl.load(V_block_ptr)  # [K_TILE_SIZE, D]
+    v_j = v_j.to(tl.float32)  # Cast to float32 for consistent computations
 
     # Initialize local accumulators for dK(j) and dV(j)
     dk_j = tl.zeros([K_TILE_SIZE, D], dtype=tl.float32)
@@ -238,6 +239,7 @@ def flash_bwd_kernel(
             order=(1, 0),
         )
         q_i = tl.load(Q_block_ptr)  # [Q_TILE_SIZE, D]
+        q_i = q_i.to(tl.float32)  # Cast to float32 for consistent computations
 
         grad_O_block_ptr = tl.make_block_ptr(
             grad_O_ptr + batch_index * stride_gob,
@@ -248,6 +250,7 @@ def flash_bwd_kernel(
             order=(1, 0),
         )
         do_i = tl.load(grad_O_block_ptr)  # [Q_TILE_SIZE, D]
+        do_i = do_i.to(tl.float32)  # Cast to float32 for consistent computations
 
         # Load Li and Di tiles
         L_block_ptr = tl.make_block_ptr(
@@ -284,11 +287,8 @@ def flash_bwd_kernel(
         # Compute attention probabilities: P_i^(j) = exp(S_i^(j) - L_i)
         p_ij = tl.exp(s_ij - l_i[:, None])  # [Q_TILE_SIZE, K_TILE_SIZE]
 
-        # Cast P_ij to match do_i's dtype for matrix multiplication
-        p_ij_cast = p_ij.to(do_i.dtype)
-
         # Compute dV^(j) += (P_i^(j))^T * dO_i
-        dv_j = tl.dot(tl.trans(p_ij_cast), do_i, acc=dv_j)  # [K_TILE_SIZE, D]
+        dv_j = tl.dot(tl.trans(p_ij), do_i, acc=dv_j)  # [K_TILE_SIZE, D]
 
         # Compute dP_i^(j) = dO_i @ (V^(j))^T
         dp_ij = tl.dot(do_i, tl.trans(v_j))  # [Q_TILE_SIZE, K_TILE_SIZE]
@@ -316,9 +316,9 @@ def flash_bwd_kernel(
         # Apply bounds mask
         dq_mask = (q_range[:, None] < N_QUERIES) & (d_range[None, :] < D)
 
-        # Cast to appropriate dtype and atomic add
-        dq_contribution_cast = dq_contribution.to(grad_Q_ptr.dtype.element_ty)
-        tl.atomic_add(dq_ptrs, dq_contribution_cast, mask=dq_mask)
+        # Cast to float32 for atomic operations (bfloat16 atomics not supported)
+        dq_contribution_f32 = dq_contribution.to(tl.float32)
+        tl.atomic_add(dq_ptrs, dq_contribution_f32, mask=dq_mask)
 
         # Compute dK^(j) += (dS_i^(j))^T @ Q_i (local accumulation, no atomics needed)
         dk_j = tl.dot(tl.trans(ds_ij), q_i, acc=dk_j)  # [K_TILE_SIZE, D]
@@ -545,10 +545,10 @@ class FlashAttentionTriton(torch.autograd.Function):
         # Compute D vector: D_i = sum_j(dO_ij * O_ij) for each query
         D = torch.sum(grad_O * O, dim=-1)  # [B, N_q]
 
-        # Initialize output tensors
-        grad_Q = torch.zeros_like(Q)
-        grad_K = torch.zeros_like(K)
-        grad_V = torch.zeros_like(V)
+        # Initialize output tensors in float32 for accumulation, will cast back later
+        grad_Q = torch.zeros_like(Q, dtype=torch.float32)
+        grad_K = torch.zeros_like(K, dtype=torch.float32)
+        grad_V = torch.zeros_like(V, dtype=torch.float32)
 
         # Use single-kernel Algorithm 2 approach with atomics for dQ
         # Grid is over K/V tiles (outer loop in Algorithm 2)
@@ -573,5 +573,10 @@ class FlashAttentionTriton(torch.autograd.Function):
             Q_TILE_SIZE=Q_TILE_SIZE,
             K_TILE_SIZE=K_TILE_SIZE,
         )
+
+        # Cast gradients back to original input dtype
+        grad_Q = grad_Q.to(Q.dtype)
+        grad_K = grad_K.to(K.dtype)
+        grad_V = grad_V.to(V.dtype)
 
         return grad_Q, grad_K, grad_V, None  # None for is_causal gradient

@@ -272,7 +272,7 @@ def run_full_sweep():
     print("=" * 60)
 
     # Representative sweep for demonstration - full sweep would take hours
-    seq_lengths = [128, 512, 2048, 8192, 32768]  # Key powers of 2
+    seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]  # Key powers of 2
     d_models = [16, 32, 64, 128]                  # All embedding dimensions
     dtypes = [torch.bfloat16, torch.float32]     # Both precisions
 
