@@ -165,6 +165,19 @@ class FlashAttentionPytorch(torch.autograd.Function):
 
 
 
+# Shared autotune configs - only varying tile sizes with fixed num_stages/num_warps
+TILE_SIZE_CONFIGS = [
+    triton.Config({'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_stages=2, num_warps=4),
+    triton.Config({'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 32}, num_stages=2, num_warps=4),
+    triton.Config({'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 64}, num_stages=2, num_warps=4),
+    triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 16}, num_stages=2, num_warps=4),
+    triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_stages=2, num_warps=4),
+    triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 64}, num_stages=2, num_warps=4),
+    triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 16}, num_stages=2, num_warps=4),
+    triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 32}, num_stages=2, num_warps=4),
+    triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_stages=2, num_warps=4),
+]
+
 @triton.jit
 def flash_bwd_kernel(
     Q_ptr, K_ptr, V_ptr, L_ptr, D_ptr,
@@ -493,21 +506,20 @@ class FlashAttentionTriton(torch.autograd.Function):
         B, N_q, d = Q.shape
         B, N_k, d = K.shape
 
-        # Choose tile sizes - make them powers of 2 for efficiency
-        Q_TILE_SIZE = 32
-        K_TILE_SIZE = 32
-
         scale = 1.0 / math.sqrt(d)
 
         # Initialize output tensors
         O = torch.empty_like(Q)
         L = torch.empty(B, N_q, device=Q.device, dtype=torch.float32)
 
-        # Launch grid: (num_q_tiles, batch_size)
-        num_q_tiles = triton.cdiv(N_q, Q_TILE_SIZE)
-        grid = (num_q_tiles, B)
+        # TODO: Autotuning disabled due to tile size coordination issues
+        # Even with shared configs, forward/backward can choose different tile sizes
+        # leading to mathematical inconsistency. Future work: implement tile size
+        # passing from forward to backward or single-kernel fwd+bwd approach.
+        Q_TILE_SIZE = 32
+        K_TILE_SIZE = 32
+        grid = (triton.cdiv(N_q, Q_TILE_SIZE), B)
 
-        # Launch kernel
         flash_fwd_kernel[grid](
             Q, K, V, O, L,
             Q.stride(0), Q.stride(1), Q.stride(2),
@@ -536,10 +548,6 @@ class FlashAttentionTriton(torch.autograd.Function):
         B, N_q, d = Q.shape
         B, N_k, d = K.shape
 
-        # Choose tile sizes - make them powers of 2 for efficiency
-        Q_TILE_SIZE = 32
-        K_TILE_SIZE = 32
-
         scale = 1.0 / math.sqrt(d)
 
         # Compute D vector: D_i = sum_j(dO_ij * O_ij) for each query
@@ -550,10 +558,10 @@ class FlashAttentionTriton(torch.autograd.Function):
         grad_K = torch.zeros_like(K, dtype=torch.float32)
         grad_V = torch.zeros_like(V, dtype=torch.float32)
 
-        # Use single-kernel Algorithm 2 approach with atomics for dQ
-        # Grid is over K/V tiles (outer loop in Algorithm 2)
-        num_k_tiles = triton.cdiv(N_k, K_TILE_SIZE)
-        grid = (num_k_tiles, B)
+        # Use same fixed tile sizes as forward for consistency
+        Q_TILE_SIZE = 32
+        K_TILE_SIZE = 32
+        grid = (triton.cdiv(N_k, K_TILE_SIZE), B)
 
         flash_bwd_kernel[grid](
             Q, K, V, L, D,
