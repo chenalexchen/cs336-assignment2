@@ -4,7 +4,7 @@ Test very large sequence lengths with small d_model
 """
 
 import torch
-from cs336_systems.flash_attention import FlashAttentionTriton
+from .flash_attention import FlashAttentionTriton
 
 def test_large_sequences():
     """Test sequence lengths beyond 8K with optimal parameters"""

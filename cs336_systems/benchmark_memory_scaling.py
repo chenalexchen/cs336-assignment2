@@ -5,7 +5,7 @@ Test how batch size and d_model affect maximum sequence length
 
 import torch
 import traceback
-from cs336_systems.flash_attention import FlashAttentionTriton
+from .flash_attention import FlashAttentionTriton
 
 def test_config(seq_len, d_model, batch_size, dtype=torch.bfloat16):
     """Test a specific configuration"""
