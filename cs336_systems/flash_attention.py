@@ -165,19 +165,6 @@ class FlashAttentionPytorch(torch.autograd.Function):
 
 
 
-# Shared autotune configs - only varying tile sizes with fixed num_stages/num_warps
-TILE_SIZE_CONFIGS = [
-    triton.Config({'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_stages=2, num_warps=4),
-    triton.Config({'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 32}, num_stages=2, num_warps=4),
-    triton.Config({'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 64}, num_stages=2, num_warps=4),
-    triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 16}, num_stages=2, num_warps=4),
-    triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_stages=2, num_warps=4),
-    triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 64}, num_stages=2, num_warps=4),
-    triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 16}, num_stages=2, num_warps=4),
-    triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 32}, num_stages=2, num_warps=4),
-    triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_stages=2, num_warps=4),
-]
-
 @triton.jit
 def flash_bwd_kernel(
     Q_ptr, K_ptr, V_ptr, L_ptr, D_ptr,
@@ -239,7 +226,18 @@ def flash_bwd_kernel(
 
     # Inner loop over Q tiles (i = 1, ..., Tq)
     num_q_tiles = tl.cdiv(N_QUERIES, Q_TILE_SIZE)
-    for q_tile_idx in range(num_q_tiles):
+
+    # Causal optimization: skip Q tiles that will be fully masked
+    if is_causal:
+        # For causal masking: q_i >= k_j, so q_i >= min(k_j) = k_start
+        # We only need Q tiles where max(q_i) = q_start + Q_TILE_SIZE - 1 >= k_start
+        # So q_start >= k_start - Q_TILE_SIZE + 1
+        min_useful_q_tile = tl.maximum(0, tl.cdiv(k_start - Q_TILE_SIZE + 1, Q_TILE_SIZE))
+        start_q_tile = min_useful_q_tile
+    else:
+        start_q_tile = 0
+
+    for q_tile_idx in range(start_q_tile, num_q_tiles):
         q_start = q_tile_idx * Q_TILE_SIZE
 
         # Load Qi, Oi, dOi tiles
@@ -290,12 +288,19 @@ def flash_bwd_kernel(
         kt_j = tl.trans(k_j)  # [D, K_TILE_SIZE]
         s_ij = tl.dot(q_i, kt_j) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
 
-        # Apply causal mask if needed
+        # Apply causal mask if needed - optimized for different tile types
         if is_causal:
-            q_indices = q_start + tl.arange(0, Q_TILE_SIZE)[:, None]  # [Q_TILE_SIZE, 1]
-            k_indices = k_start + tl.arange(0, K_TILE_SIZE)[None, :]  # [1, K_TILE_SIZE]
-            causal_mask = q_indices >= k_indices  # [Q_TILE_SIZE, K_TILE_SIZE]
-            s_ij = tl.where(causal_mask, s_ij, s_ij - 1e6)
+            k_end = k_start + K_TILE_SIZE - 1
+
+            if q_start > k_end:
+                # Fully unmasked tile: all q_i > k_j, no masking needed
+                pass  # s_ij is already correct
+            else:
+                # Diagonal tile: need element-wise comparison
+                q_indices = q_start + tl.arange(0, Q_TILE_SIZE)[:, None]  # [Q_TILE_SIZE, 1]
+                k_indices = k_start + tl.arange(0, K_TILE_SIZE)[None, :]  # [1, K_TILE_SIZE]
+                causal_mask = q_indices >= k_indices  # [Q_TILE_SIZE, K_TILE_SIZE]
+                s_ij = tl.where(causal_mask, s_ij, s_ij - 1e6)
 
         # Compute attention probabilities: P_i^(j) = exp(S_i^(j) - L_i)
         p_ij = tl.exp(s_ij - l_i[:, None])  # [Q_TILE_SIZE, K_TILE_SIZE]
@@ -309,9 +314,18 @@ def flash_bwd_kernel(
         # Compute dS_i^(j) = P_i^(j) ◦ (dP_i^(j) - D_i) / sqrt(d)
         ds_ij = p_ij * (dp_ij - d_i[:, None]) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
 
-        # Apply causal mask to dS if needed
+        # Apply causal mask to dS if needed - reuse mask logic
         if is_causal:
-            ds_ij = tl.where(causal_mask, ds_ij, 0.0)
+            if q_start > k_end:
+                # Fully unmasked tile: no masking needed for gradients
+                pass  # ds_ij is already correct
+            else:
+                # Diagonal tile: apply the same mask as before
+                # Need to recreate the mask for gradient computation
+                q_indices = q_start + tl.arange(0, Q_TILE_SIZE)[:, None]  # [Q_TILE_SIZE, 1]
+                k_indices = k_start + tl.arange(0, K_TILE_SIZE)[None, :]  # [1, K_TILE_SIZE]
+                causal_mask = q_indices >= k_indices  # [Q_TILE_SIZE, K_TILE_SIZE]
+                ds_ij = tl.where(causal_mask, ds_ij, 0.0)
 
         # Compute the dQ contribution: dS_i^(j) @ K^(j)
         dq_contribution = tl.dot(ds_ij, k_j)  # [Q_TILE_SIZE, D]
@@ -434,8 +448,16 @@ def flash_fwd_kernel(
     l_i = tl.zeros([Q_TILE_SIZE], dtype=tl.float32)
     m_i = tl.full([Q_TILE_SIZE], -float('inf'), dtype=tl.float32)
 
-    # Loop over K tiles
+    # Loop over K tiles with causal optimization
     num_k_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
+    q_start = query_tile_index * Q_TILE_SIZE
+
+    # Causal optimization: only process tiles where some attention weights are non-zero
+    if is_causal:
+        # For causal masking: q_i >= k_j, so k_j <= max(q_i) = q_start + Q_TILE_SIZE - 1
+        max_useful_k_tile = tl.cdiv(q_start + Q_TILE_SIZE, K_TILE_SIZE)
+        num_k_tiles = tl.minimum(num_k_tiles, max_useful_k_tile)
+
     for k_tile_idx in range(num_k_tiles):
         # Load K and V tiles
         k = tl.load(K_block_ptr)  # [K_TILE_SIZE, D] - coalesced load
@@ -447,17 +469,21 @@ def flash_fwd_kernel(
         # Compute attention scores: S_ij = Q_i @ K_j^T
         s_ij = tl.dot(q, k) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
 
-        # Apply causal mask if needed
+        # Apply causal mask with optimizations
         if is_causal:
-            # Create causal mask for this block
-            q_start = query_tile_index * Q_TILE_SIZE
             k_start = k_tile_idx * K_TILE_SIZE
+            k_end = k_start + K_TILE_SIZE - 1
 
-            q_indices = q_start + tl.arange(0, Q_TILE_SIZE)[:, None]  # [Q_TILE_SIZE, 1]
-            k_indices = k_start + tl.arange(0, K_TILE_SIZE)[None, :]  # [1, K_TILE_SIZE]
-
-            causal_mask = q_indices >= k_indices  # [Q_TILE_SIZE, K_TILE_SIZE]
-            s_ij = tl.where(causal_mask, s_ij, s_ij - 1e6)  # Add -1e6 to masked elements
+            # Check if this is a fully unmasked tile or needs element-wise masking
+            if k_end < q_start:
+                # Fully unmasked tile: all q_i >= k_j, no masking needed
+                pass  # s_ij is already correct
+            else:
+                # Diagonal tile: need element-wise comparison
+                q_indices = q_start + tl.arange(0, Q_TILE_SIZE)[:, None]  # [Q_TILE_SIZE, 1]
+                k_indices = k_start + tl.arange(0, K_TILE_SIZE)[None, :]  # [1, K_TILE_SIZE]
+                causal_mask = q_indices >= k_indices  # [Q_TILE_SIZE, K_TILE_SIZE]
+                s_ij = tl.where(causal_mask, s_ij, s_ij - 1e6)  # Apply mask only for diagonal tiles
 
         # Compute block max and update global max
         m_ij = tl.max(s_ij, axis=1)  # [Q_TILE_SIZE]
@@ -506,20 +532,21 @@ class FlashAttentionTriton(torch.autograd.Function):
         B, N_q, d = Q.shape
         B, N_k, d = K.shape
 
+        # Choose tile sizes - make them powers of 2 for efficiency
+        Q_TILE_SIZE = 32
+        K_TILE_SIZE = 32
+
         scale = 1.0 / math.sqrt(d)
 
         # Initialize output tensors
         O = torch.empty_like(Q)
         L = torch.empty(B, N_q, device=Q.device, dtype=torch.float32)
 
-        # TODO: Autotuning disabled due to tile size coordination issues
-        # Even with shared configs, forward/backward can choose different tile sizes
-        # leading to mathematical inconsistency. Future work: implement tile size
-        # passing from forward to backward or single-kernel fwd+bwd approach.
-        Q_TILE_SIZE = 32
-        K_TILE_SIZE = 32
-        grid = (triton.cdiv(N_q, Q_TILE_SIZE), B)
+        # Launch grid: (num_q_tiles, batch_size)
+        num_q_tiles = triton.cdiv(N_q, Q_TILE_SIZE)
+        grid = (num_q_tiles, B)
 
+        # Launch kernel
         flash_fwd_kernel[grid](
             Q, K, V, O, L,
             Q.stride(0), Q.stride(1), Q.stride(2),
@@ -548,6 +575,10 @@ class FlashAttentionTriton(torch.autograd.Function):
         B, N_q, d = Q.shape
         B, N_k, d = K.shape
 
+        # Choose tile sizes - make them powers of 2 for efficiency
+        Q_TILE_SIZE = 32
+        K_TILE_SIZE = 32
+
         scale = 1.0 / math.sqrt(d)
 
         # Compute D vector: D_i = sum_j(dO_ij * O_ij) for each query
@@ -558,10 +589,10 @@ class FlashAttentionTriton(torch.autograd.Function):
         grad_K = torch.zeros_like(K, dtype=torch.float32)
         grad_V = torch.zeros_like(V, dtype=torch.float32)
 
-        # Use same fixed tile sizes as forward for consistency
-        Q_TILE_SIZE = 32
-        K_TILE_SIZE = 32
-        grid = (triton.cdiv(N_k, K_TILE_SIZE), B)
+        # Use single-kernel Algorithm 2 approach with atomics for dQ
+        # Grid is over K/V tiles (outer loop in Algorithm 2)
+        num_k_tiles = triton.cdiv(N_k, K_TILE_SIZE)
+        grid = (num_k_tiles, B)
 
         flash_bwd_kernel[grid](
             Q, K, V, L, D,
