@@ -532,15 +532,15 @@ class FlashAttentionTriton(torch.autograd.Function):
         B, N_q, d = Q.shape
         B, N_k, d = K.shape
 
-        # Choose tile sizes - make them powers of 2 for efficiency
-        Q_TILE_SIZE = 32
-        K_TILE_SIZE = 32
-
         scale = 1.0 / math.sqrt(d)
 
         # Initialize output tensors
         O = torch.empty_like(Q)
         L = torch.empty(B, N_q, device=Q.device, dtype=torch.float32)
+
+        # Use fixed tile sizes based on autotune profiling and memory constraints
+        Q_TILE_SIZE = 32
+        K_TILE_SIZE = 64
 
         # Launch grid: (num_q_tiles, batch_size)
         num_q_tiles = triton.cdiv(N_q, Q_TILE_SIZE)
@@ -575,10 +575,6 @@ class FlashAttentionTriton(torch.autograd.Function):
         B, N_q, d = Q.shape
         B, N_k, d = K.shape
 
-        # Choose tile sizes - make them powers of 2 for efficiency
-        Q_TILE_SIZE = 32
-        K_TILE_SIZE = 32
-
         scale = 1.0 / math.sqrt(d)
 
         # Compute D vector: D_i = sum_j(dO_ij * O_ij) for each query
@@ -589,7 +585,10 @@ class FlashAttentionTriton(torch.autograd.Function):
         grad_K = torch.zeros_like(K, dtype=torch.float32)
         grad_V = torch.zeros_like(V, dtype=torch.float32)
 
-        # Use single-kernel Algorithm 2 approach with atomics for dQ
+        # Use same fixed tile sizes as forward pass for mathematical consistency
+        Q_TILE_SIZE = 32
+        K_TILE_SIZE = 64
+
         # Grid is over K/V tiles (outer loop in Algorithm 2)
         num_k_tiles = triton.cdiv(N_k, K_TILE_SIZE)
         grid = (num_k_tiles, B)
